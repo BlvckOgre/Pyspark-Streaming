@@ -1,6 +1,26 @@
 # 🚀 PySpark Structured Streaming in Databricks
 
-This project demonstrates an end-to-end implementation of **PySpark Structured Streaming** using **Databricks**. It covers concepts from JSON ingestion to advanced topics like **stateful processing**, **watermarking**, **custom triggers**, **output modes**, and **batch-level operations**. The streaming workload is built atop a **managed volume** in the Databricks workspace using the latest Delta and Spark capabilities.
+## Overview
+
+This project demonstrates a real-world implementation of **Spark Structured Streaming** using **Databricks**. It focuses on streaming semi-structured JSON data, transforming it in real time, and persisting it using Delta Lake. The objective is to explore different streaming trigger types, output modes, and apply best practices like archiving and late data handling.
+It covers concepts from JSON ingestion to advanced topics like **stateful processing**, **watermarking**, **custom triggers**, **output modes**, and **batch-level operations**. The streaming workload is built atop a **managed volume** in the Databricks workspace using the latest Delta and Spark capabilities.
+---
+
+## Environment Setup
+
+* **Platform**: Databricks
+* **Schema**: `stream`
+* **Volume**: `streaming`
+* **Source Directory**: `/Volumes/workspace/stream/streaming/jsonsource/`
+* **File Used**: `day1.json` (and later `day2.json` and `day3.json`)
+
+---
+
+## 🔐 Requirements
+
+- Databricks Runtime with Spark 3.3+
+- Delta Lake enabled workspace
+- PySpark
 
 ---
 
@@ -9,18 +29,14 @@ This project demonstrates an end-to-end implementation of **PySpark Structured S
 ```
 📆 streaming-project/
 🗂️ notebooks/
-│   🔍 01_stream_schema_and_volume_setup.py
-│   🔍 02_ingest_json_stream.py
-│   🔍 03_stateless_stateful_transforms.py
-│   🔍 04_output_modes_and_sink.py
-│   🔍 05_watermarking_and_late_data.py
-│   🔍 06_for_each_batch_processing.py
-│   🔍 07_archiving_and_triggering.py
+│   🔍 01_streaming.py
+│   🔍 02_output_modes.py
+│   🔍 03_foreach_batch.py
+│   🔍 04_window.py
 🗂️ resources/
 │   🔍 sample_json_files/
 README.md
 ```
-
 ---
 
 ## 🧠 Concepts Covered
@@ -79,104 +95,119 @@ README.md
 
 ## 🏗️ Setup in Databricks
 
-### 🔹 Create a Streaming Schema and Managed Volume
+### Directory Setup
 
 ```python
-# Create schema for the streaming workspace
-spark.sql("CREATE SCHEMA IF NOT EXISTS streaming_workspace")
-
-# Create managed volume inside the schema
-spark.sql("""
-    CREATE VOLUME IF NOT EXISTS streaming_workspace.json_volume
-    COMMENT 'Managed volume for streaming JSON data'
-""")
-```
-
-### 🔹 Upload JSON Files to Volume
-
-Upload sample JSON files to the volume path:
-
-```bash
-# Sample path to volume
-Volumes/streaming_workspace/json_volume/
-```
-
-You can use the UI or:
-
-```python
-dbutils.fs.cp("path/to/local/sample.json", "dbfs:/Volumes/streaming_workspace/json_volume/")
+dbutils.fs.mkdirs("/Volumes/workspace/stream/streaming/jsonsourcenew")
+dbutils.fs.mkdirs("/Volumes/workspace/stream/streaming/jsonsourceArchives")
+dbutils.fs.mkdirs("/Volumes/workspace/stream/streaming/jsonsink")
+dbutils.fs.mkdirs("/Volumes/workspace/stream/streaming/foreachsink/destination1")
+dbutils.fs.mkdirs("/Volumes/workspace/stream/streaming/foreachsink/destination2")
+dbutils.fs.mkdirs("/Volumes/workspace/stream/streaming/foreachsink/ckeckpointLocation")
 ```
 
 ---
 
-## 📦 Sample Code Snippet: Reading from JSON Stream
+## Streaming Pipeline Steps
+
+### 1. Load and Inspect JSON
+
+* Load multiline hierarchical JSON
+* Inspect structure via JSON formatter (e.g., jsonformatter.org)
+
+### 2. Flatten Nested Structure
+
+* Use `explode_outer()` to safely handle arrays
+* Select deep nested fields:
 
 ```python
-from pyspark.sql.types import StructType, StringType, TimestampType
-from pyspark.sql.functions import *
-
-schema = StructType() \
-    .add("user_id", StringType()) \
-    .add("event_type", StringType()) \
-    .add("event_time", TimestampType())
-
-df_stream = (
-    spark.readStream
-    .schema(schema)
-    .option("maxFilesPerTrigger", 1)
-    .json("/Volumes/streaming_workspace/json_volume/")
-)
+df = df.select("order_id", "timestamp", "customer.customer_id", "customer.name", ...)
+df = df.withColumn("items", explode_outer("items"))
+df = df.withColumn("metadata", explode_outer("metadata"))
 ```
 
----
-
-## ✅ Running the Stream
-
-You can run and stop the stream with:
+### 3. Streaming with Schema Inference
 
 ```python
-query = df_stream.writeStream \
-    .format("delta") \
+spark.conf.set("spark.sql.streaming.schemaInference", True)
+```
+
+### 4. Define Custom Schema
+
+Custom schemas are preferred for production:
+
+```python
+my_schema = """
+order_id STRING,
+timestamp STRING,
+customer STRUCT<...>,
+items ARRAY<STRUCT<...>>,
+payment STRUCT<...>,
+metadata ARRAY<STRUCT<key: STRING, value: STRING>>
+"""
+```
+
+### 5. Write Stream to Delta
+
+```python
+df.writeStream.format("delta") \
     .outputMode("append") \
-    .option("checkpointLocation", "/tmp/checkpoint/stream1") \
-    .start("/mnt/output_path")
+    .trigger(once=True) \
+    .option("checkpointLocation", ...) \
+    .option("path", ...) \
+    .start()
 ```
+
+---
+
+## Trigger Types
+
+* `.trigger(once=True)` - batch-like, reliable
+* `.trigger(processingTime="10 seconds")` - micro-batches
+* `.trigger(availableNow=True)` - fast full-load
+* `.trigger(continuous="10 seconds")` - row-level continuous
+
+## Archiving Source Files
 
 ```python
-query.stop()
+.option("cleanSource", "archive")
+.option("sourceArchiveDir", "/Volumes/.../jsonsourceArchives")
 ```
 
 ---
 
-## 🧪 Testing and Debugging
+## Output Modes
 
-- Use `.writeStream.format("console")` for real-time debugging.
-- Use `.trigger(Trigger.Once())` for development snapshots.
-
----
-
-## 💾 Archiving Processed Files
-
-In `foreachBatch`, archive files that were processed:
+### Complete Mode
 
 ```python
-def archive_files(batch_df, batch_id):
-    processed_files = batch_df.select(input_file_name()).distinct().collect()
-    for row in processed_files:
-        src = row[0]
-        dest = src.replace("json_volume", "json_volume_archive")
-        dbutils.fs.mv(src, dest)
+df.groupBy("color").agg(count("*").alias("count"))
+  .writeStream.outputMode("complete")
+```
 
-df_stream.writeStream.foreachBatch(archive_files).start()
+### Append Mode with foreachBatch
+
+```python
+def myfunc(df, batch_id):
+    df.groupBy("color").agg(count("*").alias("count"))
+      .write.format("delta")
+      .save("/Volumes/.../destination1")
 ```
 
 ---
 
-## 🔐 Requirements
+## Window Functions and Watermarking
 
-- Databricks Runtime with Spark 3.3+
-- Delta Lake enabled workspace
-- PySpark
+```python
+df.groupBy("color", window("event_time", "10 seconds"))
+  .agg(count(lit(1)).alias("color_count"))
+  .writeStream.outputMode("complete")
+```
+
+### Late Data Handling
+
+* Use `event_time` not `processing_time`
+* Watermark helps trim state and manage memory
 
 ---
 
@@ -189,11 +220,19 @@ This project helps you build a **robust, scalable streaming system** in Databric
 - Real-time transformation and enrichment
 - Late-arriving event handling
 - Custom batch-level processing
-- Output optimization
+---
+
+## Key Learnings
+
+* Schema inference is good for prototyping, but production should use defined schemas
+* Flattening nested JSON with `explode_outer` is crucial
+* Triggers offer flexibility depending on data arrival pattern
+* Window functions enable activity tracking and time-bound analytics
+* Archiving source files boosts stream management and traceability
+* `foreachBatch` gives full control over complex streaming logic
 
 ---
 
-## 📬 Contact
+## Conclusion
 
-For feedback or contributions, reach out via issues or pull requests.
-
+This project provided a comprehensive overview of how to structure and manage streaming data pipelines using Spark Structured Streaming. We covered ingestion, transformation, writing, and advanced techniques like windowing and archival—all within Databricks.
